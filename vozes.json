@@ -6,5 +6,12 @@
   {"id": "S4M4JhZIzYGUlDsYIOow", "nome": "Elena", "genero": "feminina", "descricao": "Madura, sofisticada e elegante"},
   {"id": "Eyspt3SYhZzXd1Jd3J8O", "nome": "Bia", "genero": "feminina", "descricao": "Direta, firme e assertiva"},
   {"id": "cyD08lEy76q03ER1jZ7y", "nome": "Scheila", "genero": "feminina", "descricao": "Séria, calma e direta"},
-  {"id": "7iqXtOF3wl3pomwXFY7G", "nome": "Fernanda", "genero": "feminina", "descricao": "Formal, educada e objetiva"}
+  {"id": "7iqXtOF3wl3pomwXFY7G", "nome": "Fernanda", "genero": "feminina", "descricao": "Formal, educada e objetiva"},
+  {"id": "openai-onyx", "provedor": "openai", "voz": "onyx", "nome": "Onyx (OpenAI)", "genero": "masculina", "descricao": "Voz grave da OpenAI. Precisa de OPENAI_API_KEY"},
+  {"id": "openai-echo", "provedor": "openai", "voz": "echo", "nome": "Echo (OpenAI)", "genero": "masculina", "descricao": "Voz masculina da OpenAI"},
+  {"id": "openai-nova", "provedor": "openai", "voz": "nova", "nome": "Nova (OpenAI)", "genero": "feminina", "descricao": "Voz feminina da OpenAI"},
+  {"id": "openai-shimmer", "provedor": "openai", "voz": "shimmer", "nome": "Shimmer (OpenAI)", "genero": "feminina", "descricao": "Voz feminina suave da OpenAI"},
+  {"id": "google-neural2-b", "provedor": "google", "voz": "pt-BR-Neural2-B", "nome": "Neural2 B (Google)", "genero": "masculina", "descricao": "Voz do Google em português. Precisa de GOOGLE_API_KEY"},
+  {"id": "google-neural2-a", "provedor": "google", "voz": "pt-BR-Neural2-A", "nome": "Neural2 A (Google)", "genero": "feminina", "descricao": "Voz do Google em português"},
+  {"id": "local", "provedor": "comando", "nome": "Voz local", "genero": "masculina", "descricao": "Seu comando em JARVIS_VOZ_COMANDO (ex.: Piper), sem internet"}
 ]

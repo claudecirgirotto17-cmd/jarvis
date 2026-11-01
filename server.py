@@ -7,6 +7,7 @@ pasta de trabalho, e a resposta volta falada pelo ElevenLabs.
 
 Só usa a biblioteca padrão do Python (3.9+). Rodar:  python3 server.py
 """
+import base64
 import json
 import os
 import queue
@@ -54,9 +55,31 @@ def carregar_config():
     # Ordem: variável de ambiente > .env do projeto > ~/.config/vortex-marketing/.env
     base = ler_env("~/.config/vortex-marketing/.env")
     base.update(ler_env(RAIZ / ".env"))
-    base.update({k: v for k, v in os.environ.items() if k.startswith(("JARVIS_", "ELEVENLABS_", "WHISPER_"))})
+    base.update({k: v for k, v in os.environ.items()
+                 if k.startswith(("JARVIS_", "ELEVENLABS_", "WHISPER_", "OPENAI_", "DEEPGRAM_", "GOOGLE_"))})
     pasta = Path(base.get("JARVIS_PASTA") or Path.home()).expanduser()
     return {
+        # Cérebro: claude = Claude Code (com ferramentas e trava) | chat = qualquer API compatível com a da
+        # OpenAI (OpenAI, Ollama, LM Studio, Groq, OpenRouter...), só conversa, sem ferramentas
+        "cerebro": base.get("JARVIS_CEREBRO", "claude").strip().lower(),
+        "chat_url": base.get("JARVIS_CEREBRO_URL", "https://api.openai.com/v1").rstrip("/"),
+        "chat_modelo": base.get("JARVIS_CEREBRO_MODELO", "gpt-4o-mini"),
+        "chat_chave": base.get("JARVIS_CEREBRO_CHAVE") or base.get("OPENAI_API_KEY", ""),
+        # Claude Code atrás de um gateway compatível (LiteLLM, OpenRouter...): ANTHROPIC_BASE_URL e ANTHROPIC_AUTH_TOKEN
+        "claude_url": base.get("JARVIS_CLAUDE_URL", ""),
+        "claude_chave": base.get("JARVIS_CLAUDE_CHAVE", ""),
+        # Chaves e endereços dos provedores de voz e transcrição
+        "openai_key": base.get("OPENAI_API_KEY", ""),
+        "openai_url": base.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+        "openai_modelo_voz": base.get("JARVIS_OPENAI_MODELO_VOZ", "tts-1"),
+        "openai_modelo_stt": base.get("JARVIS_OPENAI_MODELO_STT", "whisper-1"),
+        "deepgram_key": base.get("DEEPGRAM_API_KEY", ""),
+        "deepgram_modelo": base.get("JARVIS_DEEPGRAM_MODELO", "nova-2"),
+        "google_key": base.get("GOOGLE_API_KEY", ""),
+        # Voz local: comando que lê o texto na entrada padrão e grava o áudio em {saida} (ex.: Piper)
+        "voz_comando": base.get("JARVIS_VOZ_COMANDO", ""),
+        # Provedor da voz de JARVIS_VOZ quando ela não está no vozes.json
+        "provedor_voz": base.get("JARVIS_VOZ_PROVEDOR", "elevenlabs").strip().lower(),
         "pasta": pasta,
         "porta": int(base.get("JARVIS_PORTA", "8790")),
         "modelo": base.get("JARVIS_MODELO", "sonnet"),
@@ -107,6 +130,32 @@ def salvar_preferencias():
 VOZES = carregar_vozes()
 carregar_preferencias()
 AMOSTRA = "Às suas ordens, Senhor. É assim que eu vou falar com o senhor daqui pra frente."
+
+
+def resolver_voz(id_voz):
+    """Devolve (provedor, voz do provedor). Entrada do vozes.json pode trazer "provedor" e "voz";
+    sem isso vale o provedor padrão do ElevenLabs e o próprio id."""
+    for v in VOZES:
+        if v.get("id") == id_voz:
+            return v.get("provedor", "elevenlabs"), v.get("voz", id_voz)
+    return CFG["provedor_voz"], id_voz
+
+
+def voz_ativa(provedor=None):
+    """Tem como falar com esse provedor? (chave ou comando configurado)"""
+    provedor = provedor or resolver_voz(CFG["voz"])[0]
+    return bool({
+        "elevenlabs": CFG["eleven_key"],
+        "openai": CFG["openai_key"],
+        "google": CFG["google_key"],
+        "comando": CFG["voz_comando"],
+    }.get(provedor))
+
+
+def vozes_disponiveis():
+    """Vozes que aparecem na engrenagem: só as de provedores configurados (se nenhum, todas)."""
+    ok = [v for v in VOZES if voz_ativa(v.get("provedor", "elevenlabs"))]
+    return ok or VOZES
 
 
 def persona():
@@ -328,6 +377,10 @@ class SessaoClaude:
         env = os.environ.copy()
         env["JARVIS_ESTADO"] = str(ESTADO)
         env["JARVIS_PASTA"] = str(CFG["pasta"])
+        if CFG["claude_url"]:
+            env["ANTHROPIC_BASE_URL"] = CFG["claude_url"]
+        if CFG["claude_chave"]:
+            env["ANTHROPIC_AUTH_TOKEN"] = CFG["claude_chave"]
         self.livre.set()
         self.proc = subprocess.Popen(
             self.comando(), cwd=self.pasta_de_abertura(), env=env,
@@ -433,7 +486,93 @@ class SessaoClaude:
                 return {"is_error": True, "result": "Senhor, demorei demais e reiniciei a conversa. Pode repetir?"}
 
 
-SESSAO = SessaoClaude()
+LEMBRETE_CHAT = ("\n\n[modo voz: responda em no máximo 2 frases curtas, até 30 palavras, sem listas nem formatação. "
+                 "Trate-o por Senhor.]")
+NOTA_CHAT = ("\n\n## Modo sem ferramentas\nNeste modo você só conversa: não acessa arquivos, agenda, e-mail nem internet, "
+             "e não executa ações. Se ele pedir algo assim, diga em uma frase que neste modo não consegue. "
+             "Use só o que ele disser e os dados que o JARVIS já tiver buscado e anexado à pergunta.")
+
+
+class SessaoChat:
+    """Cérebro alternativo: qualquer API compatível com /chat/completions (OpenAI, Ollama, LM Studio,
+    Groq, OpenRouter...). Só conversa: não tem ferramentas, então a trava de confirmação não entra em cena.
+    Mesma interface da SessaoClaude, pro resto do servidor não notar a diferença."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.turno = None
+        self.livre = threading.Event()
+        self.livre.set()
+        self.ferramentas_turno = []
+        self.historico = []  # [{"role": ..., "content": ...}], só as últimas trocas
+        self.ativo = False
+
+    def iniciar(self):
+        self.ativo = True
+
+    def parar(self):
+        self.ativo = False
+        self.historico = []
+
+    def vivo(self):
+        return self.ativo
+
+    def interromper(self):
+        turno = self.turno
+        if not turno or turno.entregue:
+            return False
+        turno.entregar({"result": "", "interrompido": True})
+        return True
+
+    def _chamar(self, mensagens):
+        corpo = json.dumps({"model": CFG["chat_modelo"], "messages": mensagens}).encode()
+        cabecalhos = {"Content-Type": "application/json"}
+        if CFG["chat_chave"]:
+            cabecalhos["Authorization"] = "Bearer " + CFG["chat_chave"]
+        req = urllib.request.Request(CFG["chat_url"] + "/chat/completions", data=corpo, headers=cabecalhos)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            dados = json.loads(r.read().decode("utf-8"))
+        return (dados["choices"][0]["message"].get("content") or "").strip()
+
+    def perguntar(self, texto, limite=300, ao_avisar=None, aviso_apos=None):
+        with self.lock:
+            if not self.ativo:
+                self.iniciar()
+            turno = TurnoClaude(ao_avisar)
+            self.turno = turno
+            self.ferramentas_turno = []
+            mensagens = ([{"role": "system", "content": persona() + NOTA_CHAT}] + self.historico
+                         + [{"role": "user", "content": texto + LEMBRETE_CHAT}])
+
+            def trabalhar():
+                try:
+                    turno.marcar("1a_mensagem_s")
+                    resposta = self._chamar(mensagens)
+                    turno.entregar({"result": resposta})
+                except urllib.error.HTTPError as erro:
+                    detalhe = erro.read()[:200].decode("utf-8", "ignore")
+                    log({"evento": "cerebro_falhou", "codigo": erro.code, "detalhe": detalhe})
+                    turno.entregar({"is_error": True, "result": f"Senhor, o cérebro respondeu erro {erro.code}."})
+                except Exception as erro:
+                    log({"evento": "cerebro_falhou", "detalhe": repr(erro)})
+                    turno.entregar({"is_error": True, "result": "Senhor, não consegui falar com o cérebro."})
+
+            threading.Thread(target=trabalhar, daemon=True).start()
+            if aviso_apos:
+                relogio = threading.Timer(aviso_apos, turno.avisar)
+                relogio.daemon = True
+                relogio.start()
+            try:
+                r = turno.fila.get(timeout=limite)
+            except queue.Empty:
+                return {"is_error": True, "result": "Senhor, demorei demais. Pode repetir?"}
+            if not r.get("is_error") and not r.get("interrompido") and r.get("result"):
+                self.historico += [{"role": "user", "content": texto}, {"role": "assistant", "content": r["result"]}]
+                self.historico = self.historico[-20:]
+            return r
+
+
+SESSAO = SessaoChat() if CFG["cerebro"] == "chat" else SessaoClaude()
 
 
 # ---------------------------------------------------------------- transcrição
@@ -482,6 +621,58 @@ def transcrever_scribe(audio, mime):
         return json.loads(r.read().decode("utf-8")).get("text", "")
 
 
+def extensao(mime):
+    return ".mp4" if "mp4" in mime else ".ogg" if "ogg" in mime else ".webm"
+
+
+def exigir_chave(chave, nome):
+    if not chave:
+        raise RuntimeError(f"Falta {nome} no .env")
+    return chave
+
+
+def transcrever_openai(audio, mime):
+    """API de transcrição da OpenAI (também serve Groq e outros compatíveis via OPENAI_BASE_URL)."""
+    chave = exigir_chave(CFG["openai_key"], "OPENAI_API_KEY")
+    corpo, tipo = multipart({"model": CFG["openai_modelo_stt"], "language": "pt", "response_format": "json"},
+                            "fala" + extensao(mime), audio, mime)
+    req = urllib.request.Request(CFG["openai_url"] + "/audio/transcriptions", data=corpo,
+                                 headers={"Content-Type": tipo, "Authorization": "Bearer " + chave})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8")).get("text", "")
+
+
+def transcrever_deepgram(audio, mime):
+    chave = exigir_chave(CFG["deepgram_key"], "DEEPGRAM_API_KEY")
+    url = f"https://api.deepgram.com/v1/listen?model={CFG['deepgram_modelo']}&language=pt-BR&smart_format=true"
+    req = urllib.request.Request(url, data=audio, headers={"Content-Type": mime, "Authorization": "Token " + chave})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        dados = json.loads(r.read().decode("utf-8"))
+    return dados["results"]["channels"][0]["alternatives"][0].get("transcript", "")
+
+
+def transcrever_google(audio, mime):
+    """Google Cloud Speech-to-Text. Manda WAV de 16 kHz (precisa do ffmpeg), que funciona com qualquer navegador."""
+    chave = exigir_chave(CFG["google_key"], "GOOGLE_API_KEY")
+    pedido = {"config": {"encoding": "LINEAR16", "sampleRateHertz": 16000, "languageCode": "pt-BR"},
+              "audio": {"content": base64.b64encode(para_wav(audio, mime)).decode()}}
+    req = urllib.request.Request("https://speech.googleapis.com/v1/speech:recognize?key=" + chave,
+                                 data=json.dumps(pedido).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        dados = json.loads(r.read().decode("utf-8"))
+    return " ".join(x["alternatives"][0].get("transcript", "") for x in dados.get("results", []) if x.get("alternatives"))
+
+
+# JARVIS_TRANSCRICAO=elevenlabs | openai | deepgram | google | whisper (local) | auto (whisper, cai pro ElevenLabs)
+TRANSCRITORES = {
+    "whisper": transcrever_whisper,
+    "elevenlabs": transcrever_scribe,
+    "openai": transcrever_openai,
+    "deepgram": transcrever_deepgram,
+    "google": transcrever_google,
+}
+
+
 # Frases que o whisper "inventa" quando o áudio é quase só silêncio (vêm de legendas de vídeo).
 ALUCINACOES = [
     re.compile(p) for p in (
@@ -503,7 +694,7 @@ def transcrever(audio, mime):
             log({"evento": "whisper_falhou", "erro": str(erro)})
             texto = transcrever_scribe(audio, mime)
     else:
-        texto = transcrever_scribe(audio, mime)
+        texto = TRANSCRITORES.get(modo, transcrever_scribe)(audio, mime)
     texto = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", texto)  # [BLANK_AUDIO], (música)
     texto = " ".join(texto.split())
     limpo = " ".join(normalizar(texto))
@@ -545,6 +736,69 @@ def limpar_para_fala(texto):
     return texto[:700]
 
 
+def _ler_em_pedacos(resposta):
+    while True:
+        pedaco = resposta.read(4096)
+        if not pedaco:
+            return
+        yield pedaco
+
+
+def voz_elevenlabs(fala, texto):
+    url = (f"https://api.elevenlabs.io/v1/text-to-speech/{fala.voz_real}/stream"
+           "?output_format=mp3_44100_128")
+    pedido = {"text": texto, "model_id": CFG["modelo_voz"]}
+    if fala.velocidade != 1.0:
+        pedido["voice_settings"] = {"speed": fala.velocidade}
+    req = urllib.request.Request(url, data=json.dumps(pedido).encode(), headers={
+        "xi-api-key": CFG["eleven_key"], "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        yield from _ler_em_pedacos(r)
+
+
+def voz_openai(fala, texto):
+    chave = exigir_chave(CFG["openai_key"], "OPENAI_API_KEY")
+    pedido = {"model": CFG["openai_modelo_voz"], "voice": fala.voz_real, "input": texto, "response_format": "mp3"}
+    # O parâmetro de velocidade só vale nos modelos tts-1 e tts-1-hd
+    if fala.velocidade != 1.0 and CFG["openai_modelo_voz"].startswith("tts-1"):
+        pedido["speed"] = fala.velocidade
+    req = urllib.request.Request(CFG["openai_url"] + "/audio/speech", data=json.dumps(pedido).encode(), headers={
+        "Authorization": "Bearer " + chave, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        yield from _ler_em_pedacos(r)
+
+
+def voz_google(fala, texto):
+    chave = exigir_chave(CFG["google_key"], "GOOGLE_API_KEY")
+    pedido = {
+        "input": {"text": texto},
+        "voice": {"languageCode": "pt-BR", "name": fala.voz_real},
+        "audioConfig": {"audioEncoding": "MP3", "speakingRate": fala.velocidade},
+    }
+    req = urllib.request.Request("https://texttospeech.googleapis.com/v1/text:synthesize?key=" + chave,
+                                 data=json.dumps(pedido).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        yield base64.b64decode(json.loads(r.read().decode("utf-8"))["audioContent"])
+
+
+def voz_comando(fala, texto):
+    """Voz local (ex.: Piper). JARVIS_VOZ_COMANDO recebe o texto na entrada padrão e grava o áudio em {saida};
+    o ffmpeg converte pra mp3 e aplica a velocidade."""
+    exigir_chave(CFG["voz_comando"], "JARVIS_VOZ_COMANDO")
+    with tempfile.TemporaryDirectory() as tmp:
+        bruto = str(Path(tmp) / "voz.wav")
+        mp3 = str(Path(tmp) / "voz.mp3")
+        cmd = [os.path.expanduser(p.replace("{saida}", bruto)) for p in shlex.split(CFG["voz_comando"])]
+        subprocess.run(cmd, input=texto.encode("utf-8"), check=True, capture_output=True, timeout=60)
+        filtro = ["-filter:a", f"atempo={fala.velocidade}"] if fala.velocidade != 1.0 else []
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", bruto, *filtro, "-codec:a", "libmp3lame",
+                        "-q:a", "4", mp3], check=True, capture_output=True, timeout=60)
+        yield Path(mp3).read_bytes()
+
+
+GERADORES_VOZ = {"elevenlabs": voz_elevenlabs, "openai": voz_openai, "google": voz_google, "comando": voz_comando}
+
+
 class Fala:
     """Gera a voz uma vez só (ElevenLabs) e entrega aos pedaços pra quem pedir."""
 
@@ -556,6 +810,7 @@ class Fala:
         self.erro = None
         self.cond = threading.Condition()
         self.voz = voz or CFG["voz"]
+        self.provedor, self.voz_real = resolver_voz(self.voz)
         self.velocidade = velocidade if velocidade is not None else CFG["velocidade_voz"]
         threading.Thread(target=self._gerar, args=(texto,), daemon=True).start()
 
@@ -567,29 +822,21 @@ class Fala:
         return bytes(self.pedacos) if self.pronto and not self.erro else b""
 
     def _gerar(self, texto):
-        url = (f"https://api.elevenlabs.io/v1/text-to-speech/{self.voz}/stream"
-               "?output_format=mp3_44100_128")
-        pedido = {"text": texto, "model_id": CFG["modelo_voz"]}
-        if self.velocidade != 1.0:
-            pedido["voice_settings"] = {"speed": self.velocidade}
-        corpo = json.dumps(pedido).encode()
-        req = urllib.request.Request(url, data=corpo, headers={
-            "xi-api-key": CFG["eleven_key"], "Content-Type": "application/json"})
+        gerador = GERADORES_VOZ.get(self.provedor)
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                while True:
-                    pedaco = r.read(4096)
-                    if not pedaco:
-                        break
-                    with self.cond:
-                        self.pedacos.extend(pedaco)
-                        self.cond.notify_all()
+            if not gerador:
+                raise RuntimeError(f"provedor de voz desconhecido: {self.provedor}")
+            for pedaco in gerador(self, texto):
+                with self.cond:
+                    self.pedacos.extend(pedaco)
+                    self.cond.notify_all()
         except urllib.error.HTTPError as erro:
             self.erro = erro.code
-            log({"evento": "voz_falhou", "codigo": erro.code, "detalhe": erro.read()[:300].decode("utf-8", "ignore")})
+            log({"evento": "voz_falhou", "provedor": self.provedor, "codigo": erro.code,
+                 "detalhe": erro.read()[:300].decode("utf-8", "ignore")})
         except Exception as erro:
             self.erro = repr(erro)
-            log({"evento": "voz_falhou", "detalhe": repr(erro)})
+            log({"evento": "voz_falhou", "provedor": self.provedor, "detalhe": repr(erro)})
         finally:
             with self.cond:
                 self.pronto = True
@@ -745,7 +992,7 @@ def processar(audio=None, mime="audio/webm", texto=None):
                 frase = random.choice(AVISOS_PRONTOS)
             registro["aviso"] = frase + (" (pronta)" if pronta else "")
             registro["aviso_s"] = round(time.time() - inicio, 2)
-            if CFG["eleven_key"]:
+            if voz_ativa():
                 id_fala = Fala.fixa(frase) if pronta else Fala.criar(frase)
                 EVENTOS.emitir({"tipo": "fala", "texto": frase, "audio": f"/api/voz/{id_fala}"})
 
@@ -767,7 +1014,7 @@ def processar(audio=None, mime="audio/webm", texto=None):
             registro["erro"] = r.get("result")
         Turno.aguardando_confirmacao = pediu_confirmacao(resposta)
 
-        audio_url = f"/api/voz/{Fala.criar(resposta)}" if CFG["eleven_key"] else ""
+        audio_url = f"/api/voz/{Fala.criar(resposta)}" if voz_ativa() else ""
         registro["resposta"] = resposta
         registro["total_s"] = round(time.time() - inicio, 2)
         EVENTOS.emitir({
@@ -788,12 +1035,12 @@ def processar(audio=None, mime="audio/webm", texto=None):
 
 
 def config_atual():
-    return {"voz": CFG["voz"], "velocidade": CFG["velocidade_voz"], "vozes": VOZES}
+    return {"voz": CFG["voz"], "velocidade": CFG["velocidade_voz"], "vozes": vozes_disponiveis()}
 
 
 def gravar_avisos_prontos():
     """Deixa as frases prontas ("Um instante, Senhor.") gravadas na voz escolhida."""
-    if CFG["eleven_key"]:
+    if voz_ativa():
         for frase in AVISOS_PRONTOS:
             Fala.fixa(frase)
 
@@ -817,7 +1064,7 @@ def aquecer():
     try:
         SESSAO.iniciar()
         gravar_avisos_prontos()
-        if CFG["aquecer"]:
+        if CFG["aquecer"] and CFG["cerebro"] == "claude":
             with Turno.ocupado:
                 SESSAO.perguntar("(Mensagem automática de início. Não use ferramentas. Responda só: Pronto.)", limite=120)
     finally:
@@ -927,7 +1174,7 @@ class Servidor(BaseHTTPRequestHandler):
             EVENTOS.sair(q)
 
     def amostra(self, voz):
-        if voz not in {v["id"] for v in VOZES} or not CFG["eleven_key"]:
+        if voz not in {v["id"] for v in VOZES} or not voz_ativa(resolver_voz(voz)[0]):
             return self.responder(404, b"{}")
         arquivo = ESTADO / "amostras" / f"{voz}-{CFG['velocidade_voz']}.mp3"
         if not arquivo.exists():
@@ -973,10 +1220,13 @@ def main():
     completar_path()
     if not CFG["pasta"].is_dir():
         sys.exit(f"JARVIS_PASTA não existe: {CFG['pasta']}")
-    if not shutil.which("claude"):
+    if CFG["cerebro"] not in ("claude", "chat"):
+        sys.exit(f"JARVIS_CEREBRO inválido: {CFG['cerebro']} (use claude ou chat)")
+    if CFG["cerebro"] == "claude" and not shutil.which("claude"):
         sys.exit("Não achei o Claude Code (comando 'claude'). Instale antes: https://claude.com/claude-code")
-    if not CFG["eleven_key"]:
-        print("Aviso: sem ELEVENLABS_API_KEY. Ele vai responder só em texto na tela.")
+    if not voz_ativa():
+        print(f"Aviso: o provedor de voz '{resolver_voz(CFG['voz'])[0]}' não está configurado "
+              "(falta a chave ou o comando no .env). Ele vai responder só em texto na tela.")
     servidor = ThreadingHTTPServer(("127.0.0.1", CFG["porta"]), Servidor)
     servidor.daemon_threads = True
     url = f"http://localhost:{CFG['porta']}"

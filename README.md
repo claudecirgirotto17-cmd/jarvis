@@ -71,6 +71,27 @@ Mexa o mouse e aparece uma engrenagem no canto de cima. Nela você escolhe a voz
 
 A lista de vozes fica em `vozes.json`: troque ou adicione qualquer voz da Voice Library do ElevenLabs (o ID e uma descrição curta). Algumas vozes da biblioteca só funcionam depois de clicar em **Add to my voices** no site.
 
+## Trocar voz, ouvido e cérebro
+
+Tudo vem do ElevenLabs e do Claude Code por padrão, mas cada peça aceita outros provedores. Você escolhe no `.env` (modelo completo em `.env.example`).
+
+| Peça | Opções | Como escolher |
+|---|---|---|
+| **Voz** | ElevenLabs, OpenAI, Google, voz local (Piper ou outro comando) | Escolha a voz na engrenagem (aparecem as de provedores com chave) ou ponha o `id` dela em `JARVIS_VOZ`, ex. `openai-onyx`, `google-neural2-b`, `local` |
+| **Ouvido** | whisper local, ElevenLabs, OpenAI, Deepgram, Google | `JARVIS_TRANSCRICAO=openai` (ou `deepgram`, `google`, `elevenlabs`, `whisper`, `auto`) |
+| **Cérebro** | Claude Code, ou qualquer API compatível com a da OpenAI (OpenAI, Ollama, LM Studio, Groq, OpenRouter) | `JARVIS_CEREBRO=claude` (padrão) ou `chat` |
+
+Cada voz do `vozes.json` pode trazer `"provedor"` (`elevenlabs`, `openai`, `google` ou `comando`) e `"voz"` (o nome dela no provedor). Sem `"provedor"`, vale ElevenLabs. Pra acrescentar uma voz, copie uma entrada e troque `id`, `voz` e `nome`.
+
+O que muda no **modo chat** do cérebro: ele só conversa. Não tem agenda, arquivos, conectores nem terminal, e por isso a trava de confirmação nem entra em cena. Os atalhos e a pré-busca (`gatilhos.json`) continuam funcionando, porque rodam no servidor e mandam o dado junto com a pergunta. Pra manter as ferramentas com outro modelo, use o Claude Code atrás de um gateway compatível com a API da Anthropic (`JARVIS_CLAUDE_URL` e `JARVIS_CLAUDE_CHAVE`).
+
+Voz local com Piper (grátis, sem internet): instale o Piper e o `ffmpeg`, baixe uma voz em português e ponha no `.env`:
+
+```
+JARVIS_VOZ_COMANDO=piper --model ~/vozes/pt_BR-faber-medium.onnx --output_file {saida}
+JARVIS_VOZ=local
+```
+
 ## App de Mac (opcional)
 
 Pra abrir o JARVIS como um aplicativo, com ícone próprio, pelo Spotlight ou pelo Dock:
